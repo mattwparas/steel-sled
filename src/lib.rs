@@ -6,10 +6,12 @@ use bincode::{
     enc::Encoder,
     error::{DecodeError, EncodeError},
 };
-use sled::{Db, Tree};
+use sled::{Batch, Db, Tree};
 use steel::{
     rvals::Custom,
-    steel_vm::ffi::{FFIArg, FFIModule, FFIValue, RegisterFFIFn},
+    steel_vm::ffi::{
+        CustomRef, FFIArg, FFIModule, FFIValue, RegisterFFIFn, as_underlying_ffi_type,
+    },
 };
 
 steel::declare_module!(build_module);
@@ -63,6 +65,7 @@ enum SledError {
     Encoding(EncodeError),
     CannotOpenTreeFromTree,
     UnknownKeyType(String),
+    TypeMismatch(String),
 }
 
 impl Custom for SledError {}
@@ -74,6 +77,7 @@ impl std::fmt::Display for SledError {
             SledError::Encoding(encode_error) => write!(f, "{}", encode_error),
             Self::CannotOpenTreeFromTree => write!(f, "CannotOpenTreeFromTree"),
             Self::UnknownKeyType(key) => write!(f, "UnknownKeyType({})", key),
+            Self::TypeMismatch(s) => write!(f, "TypeMismatch: {}", s),
         }
     }
 }
@@ -496,28 +500,33 @@ pub fn test_basic() {
     dbg!(decoded);
 }
 
-// pub fn arg_to_value(value: FFIArg) -> Option<FFIValue> {
-//     match value {
-//         FFIArg::StringRef(rstr) => Some(FFIValue::StringV(rstr.into())),
-//         FFIArg::BoolV(b) => Some(FFIValue::BoolV(b)),
-//         FFIArg::NumV(n) => Some(FFIValue::NumV(n)),
-//         FFIArg::IntV(i) => Some(FFIValue::IntV(i)),
-//         FFIArg::Void => Some(FFIValue::Void),
-//         FFIArg::StringV(rstring) => Some(FFIValue::StringV(rstring)),
-//         FFIArg::Vector(rvec) => Some(FFIValue::Vector(
-//             rvec.into_iter().filter_map(arg_to_value).collect(),
-//         )),
-//         FFIArg::CharV { c } => Some(FFIValue::CharV { c }),
-//         FFIArg::HashMap(rhash_map) => Some(FFIValue::HashMap(
-//             rhash_map
-//                 .into_iter()
-//                 .filter_map(|x| Some((arg_to_value(x.0)?, arg_to_value(x.1)?)))
-//                 .collect(),
-//         )),
-//         FFIArg::ByteVector(rvec) => Some(FFIValue::ByteVector(rvec)),
-//         _ => None,
-//     }
-// }
+// Set up batches of changes to be applied atomically
+struct SledBatch(Batch);
+
+impl Custom for SledBatch {}
+
+impl SledBatch {
+    pub fn new() -> Self {
+        Self(Batch::default())
+    }
+
+    pub fn insert(&mut self, key: FFIArg, value: FFIArg) -> Result<(), SledError> {
+        self.0.insert(encode_arg(key)?, encode_arg(value)?);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: FFIArg) -> Result<(), SledError> {
+        self.0.remove(encode_arg(key)?);
+        Ok(())
+    }
+
+    pub fn get(&self, key: FFIArg) -> Result<Option<FFIValue>, SledError> {
+        Ok(self
+            .0
+            .get(encode_arg(key)?)
+            .and_then(|x| x.map(|x| decode_value(&x))))
+    }
+}
 
 impl KeyType {
     pub fn from_str(key_type: Option<&str>) -> Result<Self, SledError> {
@@ -600,6 +609,19 @@ impl SledDb {
                 .map_err(SledError::Io)
         })
     }
+
+    pub fn apply_batch(&self, mut batch: FFIArg) -> Result<(), SledError> {
+        if let FFIArg::CustomRef(CustomRef { custom, .. }) = &mut batch {
+            if let Some(value) = as_underlying_ffi_type::<SledBatch>(custom.get_mut()) {
+                return Ok(self.db.apply_batch(std::mem::take(&mut value.0))?);
+            }
+        }
+
+        Err(SledError::TypeMismatch(format!(
+            "Type mismatch - expected `SledBatch`, found: {:?}",
+            batch
+        )))
+    }
 }
 
 pub fn sled_module() -> FFIModule {
@@ -610,7 +632,12 @@ pub fn sled_module() -> FFIModule {
         .register_fn("db-insert", SledDb::insert)
         .register_fn("db-get", SledDb::get)
         .register_fn("db-remove", SledDb::remove)
-        .register_fn("db-open-tree", SledDb::open_tree);
+        .register_fn("db-open-tree", SledDb::open_tree)
+        .register_fn("batch", SledBatch::new)
+        .register_fn("batch-insert", SledBatch::insert)
+        .register_fn("batch-get", SledBatch::get)
+        .register_fn("batch-remove", SledBatch::remove)
+        .register_fn("db-apply-batch", SledDb::apply_batch);
 
     module
 }

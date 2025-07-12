@@ -1,4 +1,9 @@
 (#%require-dylib "libsteel_sled" (only-in
+    batch
+    batch-get
+    batch-insert
+    batch-remove
+    db-apply-batch
     db-get
     db-insert
     db-open
@@ -6,6 +11,11 @@
     db-remove
 ))
 (provide 
+    batch
+    batch-get
+    batch-insert
+    batch-remove
+    db-apply-batch
     db-get
     db-insert
     db-open
