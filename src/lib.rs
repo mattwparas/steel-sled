@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::ops::Deref;
 
 use abi_stable::std_types::{RHashMap, RString, RVec, Tuple2};
 use bincode::{
@@ -6,7 +6,7 @@ use bincode::{
     enc::Encoder,
     error::{DecodeError, EncodeError},
 };
-use sled::Db;
+use sled::{Db, Tree};
 use steel::{
     rvals::Custom,
     steel_vm::ffi::{FFIArg, FFIModule, FFIValue, RegisterFFIFn},
@@ -18,19 +18,83 @@ pub fn build_module() -> FFIModule {
     sled_module()
 }
 
+#[derive(Copy, Clone, Debug)]
 enum KeyType {
     Integer,
     String,
+    Bytes,
+    Any,
+}
+
+enum DbOrTree {
+    Db(Db<1024>),
+    Tree(Tree<1024>),
+}
+
+impl AsRef<Tree> for DbOrTree {
+    fn as_ref(&self) -> &Tree {
+        match self {
+            DbOrTree::Db(db) => &db,
+            DbOrTree::Tree(tree) => tree,
+        }
+    }
+}
+
+impl Deref for DbOrTree {
+    type Target = Tree<1024>;
+    fn deref(&self) -> &Tree {
+        match self {
+            DbOrTree::Db(db) => &db,
+            DbOrTree::Tree(tree) => tree,
+        }
+    }
 }
 
 // Values have to be encoded correctly, values are encoded
 // more or less directly as the enum values unless otherwise specified.
 struct SledDb {
-    // I'd love to not have to mutex this since we're already guarded behind a mutex.
-    // I can probably relax the constraints on this since this whole thing will be guarded.
-    db: Mutex<Db<1024>>,
+    db: DbOrTree,
     key_type: KeyType,
 }
+
+#[derive(Debug)]
+enum SledError {
+    Io(std::io::Error),
+    Encoding(EncodeError),
+    CannotOpenTreeFromTree,
+    UnknownKeyType(String),
+}
+
+impl Custom for SledError {}
+
+impl std::fmt::Display for SledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SledError::Io(error) => write!(f, "{}", error),
+            SledError::Encoding(encode_error) => write!(f, "{}", encode_error),
+            Self::CannotOpenTreeFromTree => write!(f, "CannotOpenTreeFromTree"),
+            Self::UnknownKeyType(key) => write!(f, "UnknownKeyType({})", key),
+        }
+    }
+}
+
+impl From<EncodeError> for SledError {
+    fn from(value: EncodeError) -> Self {
+        Self::Encoding(value)
+    }
+}
+
+impl From<std::io::Error> for SledError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl std::error::Error for SledError {}
+
+// We're good here since the steel side
+// is going to be sync
+unsafe impl Sync for SledDb {}
 
 impl Custom for SledDb {}
 
@@ -38,53 +102,63 @@ struct BincodeWrapper {
     value: FFIValue,
 }
 
-pub(crate) fn encode_slice_len<E: Encoder>(encoder: &mut E, len: usize) -> Result<(), EncodeError> {
-    (len as u64).encode(encoder)
+// Encode directly to a FFIValue!
+struct ArgBincodeWrapper<'a> {
+    value: FFIArg<'a>,
 }
 
-impl Encode for BincodeWrapper {
+impl<'a> Encode for ArgBincodeWrapper<'a> {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
         // Manually do our recursion here
         fn encode_inner<EI: bincode::enc::Encoder>(
-            this: &FFIValue,
+            this: &FFIArg,
             encoder: &mut EI,
         ) -> Result<(), bincode::error::EncodeError> {
             match this {
-                FFIValue::BoolV(b) => {
+                FFIArg::BoolV(b) => {
                     bincode::Encode::encode(&0u32, encoder)?;
                     bincode::Encode::encode(b, encoder)?
                 }
-                FFIValue::NumV(n) => {
+                FFIArg::NumV(n) => {
                     bincode::Encode::encode(&1u32, encoder)?;
                     bincode::Encode::encode(n, encoder)?
                 }
-                FFIValue::IntV(i) => {
+                FFIArg::IntV(i) => {
                     bincode::Encode::encode(&2u32, encoder)?;
                     bincode::Encode::encode(i, encoder)?
                 }
-                FFIValue::Void => {
+                FFIArg::Void => {
                     bincode::Encode::encode(&3u32, encoder)?;
                     bincode::Encode::encode("#<void>", encoder)?
                 }
-                FFIValue::StringV(rstring) => {
+                FFIArg::StringV(rstring) => {
                     bincode::Encode::encode(&4u32, encoder)?;
                     bincode::Encode::encode(rstring.as_str(), encoder)?
                 }
-                FFIValue::Vector(rvec) => {
+                FFIArg::Vector(rvec) => {
                     bincode::Encode::encode(&5u32, encoder)?;
                     encode_slice_len(encoder, rvec.len())?;
                     for value in rvec {
                         encode_inner(value, encoder)?;
                     }
                 }
-                FFIValue::CharV { c } => {
+
+                FFIArg::VectorRef(rvec) => {
+                    bincode::Encode::encode(&5u32, encoder)?;
+                    encode_slice_len(encoder, rvec.vec.len())?;
+                    for value in rvec.vec.iter() {
+                        encode_value_inner(value, encoder)?;
+                    }
+                }
+
+                FFIArg::CharV { c } => {
                     bincode::Encode::encode(&6u32, encoder)?;
                     bincode::Encode::encode(c, encoder)?
                 }
-                FFIValue::HashMap(rhash_map) => {
+                FFIArg::HashMap(rhash_map) => {
                     bincode::Encode::encode(&7u32, encoder)?;
                     encode_slice_len(encoder, rhash_map.len())?;
 
@@ -95,7 +169,7 @@ impl Encode for BincodeWrapper {
                         encode_inner(value, encoder)?;
                     }
                 }
-                FFIValue::ByteVector(rvec) => {
+                FFIArg::ByteVector(rvec) => {
                     bincode::Encode::encode(&8u32, encoder)?;
                     bincode::Encode::encode(rvec.as_slice(), encoder)?;
                     for value in rvec {
@@ -114,6 +188,85 @@ impl Encode for BincodeWrapper {
         }
 
         encode_inner(&self.value, encoder)
+    }
+}
+
+pub(crate) fn encode_slice_len<E: Encoder>(encoder: &mut E, len: usize) -> Result<(), EncodeError> {
+    (len as u64).encode(encoder)
+}
+
+// Manually do our recursion here
+fn encode_value_inner<EI: bincode::enc::Encoder>(
+    this: &FFIValue,
+    encoder: &mut EI,
+) -> Result<(), bincode::error::EncodeError> {
+    match this {
+        FFIValue::BoolV(b) => {
+            bincode::Encode::encode(&0u32, encoder)?;
+            bincode::Encode::encode(b, encoder)?
+        }
+        FFIValue::NumV(n) => {
+            bincode::Encode::encode(&1u32, encoder)?;
+            bincode::Encode::encode(n, encoder)?
+        }
+        FFIValue::IntV(i) => {
+            bincode::Encode::encode(&2u32, encoder)?;
+            bincode::Encode::encode(i, encoder)?
+        }
+        FFIValue::Void => {
+            bincode::Encode::encode(&3u32, encoder)?;
+            bincode::Encode::encode("#<void>", encoder)?
+        }
+        FFIValue::StringV(rstring) => {
+            bincode::Encode::encode(&4u32, encoder)?;
+            bincode::Encode::encode(rstring.as_str(), encoder)?
+        }
+        FFIValue::Vector(rvec) => {
+            bincode::Encode::encode(&5u32, encoder)?;
+            encode_slice_len(encoder, rvec.len())?;
+            for value in rvec {
+                encode_value_inner(value, encoder)?;
+            }
+        }
+        FFIValue::CharV { c } => {
+            bincode::Encode::encode(&6u32, encoder)?;
+            bincode::Encode::encode(c, encoder)?
+        }
+        FFIValue::HashMap(rhash_map) => {
+            bincode::Encode::encode(&7u32, encoder)?;
+            encode_slice_len(encoder, rhash_map.len())?;
+
+            // Encode the hash map just as a series
+            // of key value pairs.
+            for Tuple2(key, value) in rhash_map {
+                encode_value_inner(key, encoder)?;
+                encode_value_inner(value, encoder)?;
+            }
+        }
+        FFIValue::ByteVector(rvec) => {
+            bincode::Encode::encode(&8u32, encoder)?;
+            bincode::Encode::encode(rvec.as_slice(), encoder)?;
+            for value in rvec {
+                bincode::Encode::encode(value, encoder)?;
+            }
+        }
+        _ => {
+            return Err(EncodeError::OtherString(format!(
+                "Value not encodable: {:?}",
+                this
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+impl Encode for BincodeWrapper {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        encode_value_inner(&self.value, encoder)
     }
 }
 
@@ -269,13 +422,12 @@ impl<Context> Decode<Context> for BincodeWrapper {
                     maybe_return!(value);
                 }
                 7 => {
-                    // Push on the size, alongside a vector with the capacity
-                    // that we want.
+                    // Similar to vector here, we have encoded how long the map is.
+                    // Realistically we should branch and have a separate allocation type
+                    // for this, but that is more difficult since we'll have to
+                    // decide for keys vs values.
                     let size = u64::decode(decoder)?;
 
-                    // Now, we'll start pushing values on.
-                    // Once those values are done, we'll pop it off, and otherwise
-                    // push it in to the remaining stack
                     stack.push((size as _, ValueKind::Map, RVec::with_capacity(size as usize * 2)));
                 }
                 ,
@@ -306,9 +458,15 @@ impl<Context> Decode<Context> for BincodeWrapper {
     }
 }
 
-pub fn encode_value(value: FFIValue) -> Vec<u8> {
+// TODO: Provide a configuration for sharing the buffer
+pub fn encode_value(value: FFIValue) -> Result<Vec<u8>, EncodeError> {
     let val = BincodeWrapper { value };
-    bincode::encode_to_vec(val, bincode::config::standard()).unwrap()
+    bincode::encode_to_vec(val, bincode::config::standard())
+}
+
+pub fn encode_arg(value: FFIArg) -> Result<Vec<u8>, EncodeError> {
+    let val = ArgBincodeWrapper { value };
+    bincode::encode_to_vec(val, bincode::config::standard())
 }
 
 pub fn decode_value(bytes: &[u8]) -> FFIValue {
@@ -333,122 +491,114 @@ pub fn test_basic() {
     );
 
     let encoded = encode_value(value);
-    let decoded = decode_value(encoded.as_slice());
+    let decoded = decode_value(encoded.unwrap().as_slice());
 
     dbg!(decoded);
 }
 
-// Conversions for the purposes of storing the values
-// in sled
-fn arg_to_value(value: FFIArg) -> Option<FFIValue> {
-    match value {
-        FFIArg::StringRef(rstr) => Some(FFIValue::StringV(rstr.into())),
-        FFIArg::BoolV(b) => Some(FFIValue::BoolV(b)),
-        FFIArg::NumV(n) => Some(FFIValue::NumV(n)),
-        FFIArg::IntV(i) => Some(FFIValue::IntV(i)),
-        FFIArg::Void => Some(FFIValue::Void),
-        FFIArg::StringV(rstring) => Some(FFIValue::StringV(rstring)),
-        FFIArg::Vector(rvec) => Some(FFIValue::Vector(
-            rvec.into_iter().filter_map(arg_to_value).collect(),
-        )),
-        FFIArg::CharV { c } => Some(FFIValue::CharV { c }),
-        // FFIArg::HashMap(rhash_map) => todo!(),
-        FFIArg::ByteVector(rvec) => Some(FFIValue::ByteVector(rvec)),
-        _ => None,
+// pub fn arg_to_value(value: FFIArg) -> Option<FFIValue> {
+//     match value {
+//         FFIArg::StringRef(rstr) => Some(FFIValue::StringV(rstr.into())),
+//         FFIArg::BoolV(b) => Some(FFIValue::BoolV(b)),
+//         FFIArg::NumV(n) => Some(FFIValue::NumV(n)),
+//         FFIArg::IntV(i) => Some(FFIValue::IntV(i)),
+//         FFIArg::Void => Some(FFIValue::Void),
+//         FFIArg::StringV(rstring) => Some(FFIValue::StringV(rstring)),
+//         FFIArg::Vector(rvec) => Some(FFIValue::Vector(
+//             rvec.into_iter().filter_map(arg_to_value).collect(),
+//         )),
+//         FFIArg::CharV { c } => Some(FFIValue::CharV { c }),
+//         FFIArg::HashMap(rhash_map) => Some(FFIValue::HashMap(
+//             rhash_map
+//                 .into_iter()
+//                 .filter_map(|x| Some((arg_to_value(x.0)?, arg_to_value(x.1)?)))
+//                 .collect(),
+//         )),
+//         FFIArg::ByteVector(rvec) => Some(FFIValue::ByteVector(rvec)),
+//         _ => None,
+//     }
+// }
+
+impl KeyType {
+    pub fn from_str(key_type: Option<&str>) -> Result<Self, SledError> {
+        match key_type {
+            Some("integer") => Ok(KeyType::Integer),
+            Some("string") => Ok(KeyType::String),
+            Some("bytes") => Ok(KeyType::Bytes),
+            None => Ok(KeyType::Any),
+            Some(other) => Err(SledError::UnknownKeyType(other.to_string())),
+        }
     }
 }
 
 impl SledDb {
-    // Set up key type properly
-    pub fn open(path: String, key_type: String) -> Self {
+    pub fn call_with_key<T, F: FnOnce(&Self, &[u8]) -> Result<T, SledError>>(
+        &self,
+        arg: FFIArg,
+        thunk: F,
+    ) -> Result<T, SledError> {
+        match (arg, &self.key_type) {
+            // TODO: Natively convert structs? Make FFI structs?
+            (FFIArg::IntV(i), KeyType::Integer) => thunk(self, &i.to_be_bytes()),
+            (FFIArg::StringV(s), KeyType::String) => thunk(self, s.as_bytes()),
+            (FFIArg::StringRef(s), KeyType::String) => thunk(self, s.as_bytes()),
+            (FFIArg::ByteVector(b), KeyType::Bytes) => thunk(self, b.as_slice()),
+
+            (arg, k) => Err(SledError::Encoding(EncodeError::OtherString(format!(
+                "Unable to encode key according to schema {:?} : {:?}",
+                k, arg
+            )))),
+        }
+    }
+
+    pub fn open(path: String, key_type: Option<String>) -> Result<Self, SledError> {
         let db = Db::open_with_config(&sled::Config::new().path(path)).unwrap();
 
-        let key_type = match key_type.as_str() {
-            "integer" => KeyType::Integer,
-            "string" => KeyType::String,
-            _ => panic!("Unexpected key type"),
-        };
+        let key_type = KeyType::from_str(key_type.as_ref().map(|x| x.as_str()))?;
 
-        Self {
-            db: Mutex::new(db),
+        Ok(Self {
+            db: DbOrTree::Db(db),
             key_type,
+        })
+    }
+
+    pub fn open_tree(&self, name: String, key_type: Option<String>) -> Result<Self, SledError> {
+        let key_type = KeyType::from_str(key_type.as_ref().map(|x| x.as_str()))?;
+
+        match &self.db {
+            DbOrTree::Db(db) => Ok(Self {
+                db: DbOrTree::Tree(db.open_tree(name)?),
+                key_type,
+            }),
+            DbOrTree::Tree(_) => Err(SledError::CannotOpenTreeFromTree),
         }
     }
 
-    // Get via key? And then do some stuff
-    // after that? Serializing? Deserializing?
-    pub fn insert(&self, arg: FFIArg, value: FFIArg) {
-        match (arg, &self.key_type) {
-            (FFIArg::IntV(i), KeyType::Integer) => {
-                let value = arg_to_value(value).unwrap();
-                self.db
-                    .lock()
-                    .unwrap()
-                    .insert(i.to_be_bytes(), encode_value(value))
-                    .unwrap();
-            }
-            // Set up using the proper thing
-            (FFIArg::StringV(s), KeyType::String) => {
-                let value = arg_to_value(value).unwrap();
-                self.db
-                    .lock()
-                    .unwrap()
-                    .insert(s.as_bytes(), encode_value(value))
-                    .unwrap();
-            }
-
-            (FFIArg::StringRef(s), KeyType::String) => {
-                let value = arg_to_value(value).unwrap();
-                self.db
-                    .lock()
-                    .unwrap()
-                    .insert(s.as_bytes(), encode_value(value))
-                    .unwrap();
-            }
-            _ => {
-                todo!()
-            }
-        }
+    pub fn insert(&self, arg: FFIArg, value: FFIArg) -> Result<Option<FFIValue>, SledError> {
+        self.call_with_key(arg, move |this: &Self, key| {
+            this.db
+                .insert(key, encode_arg(value)?)
+                .map(|x| x.map(|x| decode_value(&x)))
+                .map_err(SledError::Io)
+        })
     }
 
-    pub fn get(&self, key: FFIArg) -> Option<FFIValue> {
-        let value = match (key, &self.key_type) {
-            (FFIArg::IntV(i), KeyType::Integer) => {
-                self.db.lock().unwrap().get(i.to_be_bytes()).unwrap()
-            }
-            // Set up using the proper thing
-            (FFIArg::StringV(s), KeyType::String) => {
-                self.db.lock().unwrap().get(s.as_bytes()).unwrap()
-            }
-            (FFIArg::StringRef(s), KeyType::String) => {
-                self.db.lock().unwrap().get(s.as_bytes()).unwrap()
-            }
-            _ => {
-                todo!()
-            }
-        };
-
-        value.map(|x| decode_value(&x))
+    pub fn get(&self, key: FFIArg) -> Result<Option<FFIValue>, SledError> {
+        self.call_with_key(key, move |this: &Self, key| {
+            this.db
+                .get(key)
+                .map(|x| x.map(|x| decode_value(&x)))
+                .map_err(SledError::Io)
+        })
     }
 
-    pub fn remove(&self, key: FFIArg) -> Option<FFIValue> {
-        let value = match (key, &self.key_type) {
-            (FFIArg::IntV(i), KeyType::Integer) => {
-                self.db.lock().unwrap().remove(i.to_be_bytes()).unwrap()
-            }
-            // Set up using the proper thing
-            (FFIArg::StringV(s), KeyType::String) => {
-                self.db.lock().unwrap().remove(s.as_bytes()).unwrap()
-            }
-            (FFIArg::StringRef(s), KeyType::String) => {
-                self.db.lock().unwrap().remove(s.as_bytes()).unwrap()
-            }
-            _ => {
-                todo!()
-            }
-        };
-
-        value.map(|x| decode_value(&x))
+    pub fn remove(&self, key: FFIArg) -> Result<Option<FFIValue>, SledError> {
+        self.call_with_key(key, move |this: &Self, key| {
+            this.db
+                .remove(key)
+                .map(|x| x.map(|x| decode_value(&x)))
+                .map_err(SledError::Io)
+        })
     }
 }
 
@@ -459,7 +609,8 @@ pub fn sled_module() -> FFIModule {
         .register_fn("db-open", SledDb::open)
         .register_fn("db-insert", SledDb::insert)
         .register_fn("db-get", SledDb::get)
-        .register_fn("db-remove", SledDb::remove);
+        .register_fn("db-remove", SledDb::remove)
+        .register_fn("db-open-tree", SledDb::open_tree);
 
     module
 }
