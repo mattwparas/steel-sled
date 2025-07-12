@@ -1,0 +1,18 @@
+[package]
+name = "steel-sled"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+name = "steel_sled"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# steel-core = { version = "0.7.0", git = "https://github.com/mattwparas/steel.git", features = ["dylibs", "sync"] }
+
+steel-core = { version = "0.7.0", path = "/Users/matt/code/scratch/steel/crates/steel-core", features = ["dylibs", "sync"] }
+
+abi_stable = "0.11.1"
+sled = { git = "https://github.com/spacejam/sled.git" }
+bincode = "2"
