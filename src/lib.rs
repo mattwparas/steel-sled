@@ -611,10 +611,8 @@ impl SledDb {
     }
 
     pub fn apply_batch(&self, mut batch: FFIArg) -> Result<(), SledError> {
-        if let FFIArg::CustomRef(CustomRef { custom, .. }) = &mut batch {
-            if let Some(value) = as_underlying_ffi_type::<SledBatch>(custom.get_mut()) {
-                return Ok(self.db.apply_batch(std::mem::take(&mut value.0))?);
-            }
+        if let Some(value) = as_custom_type::<SledBatch>(&mut batch) {
+            return Ok(self.db.apply_batch(std::mem::take(&mut value.0))?);
         }
 
         Err(SledError::TypeMismatch(format!(
@@ -622,6 +620,22 @@ impl SledDb {
             batch
         )))
     }
+
+    pub fn flush(&self) -> Result<(), SledError> {
+        let _ = self.db.flush()?;
+        Ok(())
+    }
+
+    // pub fn compare_and_swap(&self, key: Option<FFIArg>, old: Option<FFIArg>) -> Result {
+    // }
+}
+
+pub fn as_custom_type<'a, T: Custom + 'static>(value: &'a mut FFIArg) -> Option<&'a mut T> {
+    if let FFIArg::CustomRef(CustomRef { custom, .. }) = value {
+        return as_underlying_ffi_type::<T>(custom.get_mut());
+    }
+
+    None
 }
 
 pub fn sled_module() -> FFIModule {
@@ -637,7 +651,8 @@ pub fn sled_module() -> FFIModule {
         .register_fn("batch-insert", SledBatch::insert)
         .register_fn("batch-get", SledBatch::get)
         .register_fn("batch-remove", SledBatch::remove)
-        .register_fn("db-apply-batch", SledDb::apply_batch);
+        .register_fn("db-apply-batch", SledDb::apply_batch)
+        .register_fn("db-flush", SledDb::flush);
 
     module
 }

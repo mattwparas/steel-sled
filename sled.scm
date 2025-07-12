@@ -4,6 +4,7 @@
     batch-insert
     batch-remove
     db-apply-batch
+    db-flush
     db-get
     db-insert
     db-open
@@ -16,6 +17,7 @@
     batch-insert
     batch-remove
     db-apply-batch
+    db-flush
     db-get
     db-insert
     db-open
