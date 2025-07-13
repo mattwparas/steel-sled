@@ -142,6 +142,12 @@ impl<'a> Encode for ArgBincodeWrapper<'a> {
                     bincode::Encode::encode(&4u32, encoder)?;
                     bincode::Encode::encode(rstring.as_str(), encoder)?
                 }
+
+                FFIArg::StringRef(rstring) => {
+                    bincode::Encode::encode(&4u32, encoder)?;
+                    bincode::Encode::encode(rstring.as_str(), encoder)?
+                }
+
                 FFIArg::Vector(rvec) => {
                     bincode::Encode::encode(&5u32, encoder)?;
                     encode_slice_len(encoder, rvec.len())?;
@@ -552,6 +558,8 @@ impl SledDb {
             (FFIArg::StringV(s), KeyType::String) => thunk(self, s.as_bytes()),
             (FFIArg::StringRef(s), KeyType::String) => thunk(self, s.as_bytes()),
             (FFIArg::ByteVector(b), KeyType::Bytes) => thunk(self, b.as_slice()),
+
+            (arg, KeyType::Any) => thunk(self, encode_arg(arg)?.as_slice()),
 
             (arg, k) => Err(SledError::Encoding(EncodeError::OtherString(format!(
                 "Unable to encode key according to schema {:?} : {:?}",
